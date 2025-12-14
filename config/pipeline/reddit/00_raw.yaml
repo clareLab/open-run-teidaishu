@@ -1,8 +1,8 @@
 raw_root: data/reddit/00_raw
 apps_root: apps/reddit/harvest
 
-lookback_days: 7
-page_limit: 100
+lookback_days: 4
+page_limit: 65536
 sleep_sec: 0
 
 subreddits:

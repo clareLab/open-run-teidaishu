@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$ROOT_DIR/scripts/lib/yaml.sh"
 source "$ROOT_DIR/scripts/lib/log.sh"
 
-CFG="${CFG:-$ROOT_DIR/config/reddit/00_raw.yaml}"
+CFG="${CFG:-$ROOT_DIR/config/pipeline/reddit/00_raw.yaml}"
 
 : "${REDDIT_CLIENT_ID:?REDDIT_CLIENT_ID not set}"
 : "${REDDIT_CLIENT_SECRET:?REDDIT_CLIENT_SECRET not set}"
