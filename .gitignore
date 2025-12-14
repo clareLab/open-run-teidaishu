@@ -1,4 +1,5 @@
 /data/import
 /data/reddit/00_raw
+/data/reddit/01_parquet
 
 .env.dev
