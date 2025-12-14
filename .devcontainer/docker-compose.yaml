@@ -1,9 +1,9 @@
 services:
   open-run-teidaishu-dev:
     image: ghcr.io/open-run-org/teidaishu-dev:latest
-    build:
-      context: ..
-      dockerfile: Dockerfile.dev
+    # build:
+    #   context: ..
+    #   dockerfile: Dockerfile.dev
     container_name: open-run-teidaishu-dev
     working_dir: /workspace
     env_file:
