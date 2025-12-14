@@ -33,11 +33,43 @@ list_thread_dirs() {
   done < <(iter_days "$lookback")
 }
 
-capture14() {
-  local cap12="$1"
-  duckdb :memory: -noheader -batch -c "
-    SELECT strftime(to_timestamp(epoch(strptime('${cap12}', '%y%m%d%H%M%S'))), '%Y%m%d%H%M%S');
-  " 2>/dev/null | tr -d '\r\n'
+is_yyyymmddhhmmss() { [[ "$1" =~ ^[0-9]{14}$ ]]; }
+
+batch_init() {
+  local f="$1" threads="$2"
+  : > "$f"
+  if [[ "$threads" -gt 0 ]]; then
+    printf "SET threads=%s;\n" "$threads" >> "$f"
+  fi
+}
+
+batch_flush() {
+  local sql_file="$1" errf="$2" meta_name="$3" out_name="$4"
+  local -n meta_arr="$meta_name"
+  local -n out_arr="$out_name"
+
+  if [[ "${#out_arr[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  if ! duckdb :memory: -batch -bail < "$sql_file" >/dev/null 2>"$errf"; then
+    tail -n 200 "$errf" >&2 || true
+    return 1
+  fi
+
+  local i
+  for i in "${!out_arr[@]}"; do
+    if [[ -f "${out_arr[$i]}" ]]; then
+      log_info "${meta_arr[$i]}"
+    else
+      log_error "${meta_arr[$i]} reason=missing_out"
+      return 1
+    fi
+  done
+
+  meta_arr=()
+  out_arr=()
+  return 0
 }
 
 [[ -f "$CFG" ]] || { log_error "config not found: $CFG"; exit 1; }
@@ -47,20 +79,40 @@ RAW_ROOT="$(yaml_get "$CFG" "raw_root")"
 PARQUET_ROOT="$(yaml_get "$CFG" "parquet_root")"
 COMPRESSION="$(yaml_get "$CFG" "compression")"
 LOOKBACK_DAYS="$(yaml_get "$CFG" "lookback_days")"
+THREADS="$(yaml_get "$CFG" "duckdb_threads")"
+BATCH_SIZE="$(yaml_get "$CFG" "batch_size")"
 
 RAW_ROOT="${RAW_ROOT:-data/reddit/00_raw}"
 PARQUET_ROOT="${PARQUET_ROOT:-data/reddit/01_parquet}"
 COMPRESSION="${COMPRESSION:-zstd}"
 LOOKBACK_DAYS="${LOOKBACK_DAYS:-0}"
-LOOKBACK_DAYS="${LOOKBACK_DAYS:-0}"
+THREADS="${THREADS:-0}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+
 [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || { log_error "bad lookback_days=$LOOKBACK_DAYS"; exit 1; }
+[[ "$THREADS" =~ ^[0-9]+$ ]] || { log_error "bad duckdb_threads=$THREADS"; exit 1; }
+[[ "$BATCH_SIZE" =~ ^[0-9]+$ ]] || { log_error "bad batch_size=$BATCH_SIZE"; exit 1; }
+[[ "$BATCH_SIZE" -gt 0 ]] || { log_error "bad batch_size=$BATCH_SIZE"; exit 1; }
 
 mapfile -t subs < <(yaml_list "$CFG" "subreddits")
 TOTAL="${#subs[@]}"
 [[ "$TOTAL" -gt 0 ]] || { log_error "no subreddits found in $CFG"; exit 1; }
 
+copy_opts="FORMAT parquet, COMPRESSION '${COMPRESSION}'"
+if [[ "${COMPRESSION,,}" == "zstd" ]]; then
+  copy_opts="FORMAT parquet, COMPRESSION '${COMPRESSION}', COMPRESSION_LEVEL 22"
+fi
+
 task_start "reddit:01_parquet"
-log_info "cfg=$CFG raw_root=$RAW_ROOT parquet_root=$PARQUET_ROOT lookback_days=$LOOKBACK_DAYS compression=$COMPRESSION subs=$TOTAL"
+log_info "cfg=$CFG raw_root=$RAW_ROOT parquet_root=$PARQUET_ROOT lookback_days=$LOOKBACK_DAYS compression=$COMPRESSION duckdb_threads=$THREADS batch_size=$BATCH_SIZE subs=$TOTAL"
+
+sql_file="$(mktemp)"
+err_file="$(mktemp)"
+batch_init "$sql_file" "$THREADS"
+
+declare -a write_metas=()
+declare -a out_paths=()
+queued=0
 
 g_threads=0
 g_files=0
@@ -100,65 +152,99 @@ for sub in "${subs[@]}"; do
         files=$((files+1)); g_files=$((g_files+1))
 
         base="$(basename "$f" .jsonl)"
-        capture_ts="${base%%_*}"
+        cap14="${base%%_*}"
         hash="${base#*_}"
-        capture_ts14="$(capture14 "$capture_ts")"
-        [[ -n "$capture_ts14" ]] || { log_error "subreddit=$sub kind=$kind action=fail reason=bad_capture_ts file=$(basename "$f")"; exit 1; }
 
-        out="$out_thread_dir/${capture_ts14}_${hash}.parquet"
+        if ! is_yyyymmddhhmmss "$cap14"; then
+          log_error "subreddit=$sub kind=$kind action=fail thread=$y/$md/$thread file=$(basename "$f") reason=bad_capture_ts capture=$cap14"
+          rm -f "$sql_file" "$err_file"
+          task_end "reddit:01_parquet"
+          exit 2
+        fi
+
+        out="$out_thread_dir/${cap14}_${hash}.parquet"
 
         if [[ -f "$out" ]]; then
           skipped=$((skipped+1)); g_skip=$((g_skip+1))
-          log_info "subreddit=$sub kind=$kind action=skip scope=file thread=$y/$md/$thread file=$(basename "$f") reason=exists out=$out"
+          log_info "subreddit=$sub kind=$kind action=skip scope=file thread=$y/$md/$thread file=$(basename "$f") reason=exists out=$(basename "$out")"
           continue
         fi
 
         mkdir -p "$out_thread_dir"
 
+        log_info "subreddit=$sub kind=$kind action=plan thread=$y/$md/$thread file=$(basename "$f") out=$(basename "$out")"
+
         in_esc="$(esc_sql "$f")"
         out_esc="$(esc_sql "$out")"
 
         if [[ "$kind" == "submissions" ]]; then
-          duckdb :memory: -c "
-            COPY (
-              SELECT
-                coalesce(author, '') AS author,
-                '${sid}' AS submission_id,
-                CAST(epoch(strptime('${created_str}', '%Y%m%d%H%M%S')) AS BIGINT) AS created_utc,
-                CAST(epoch(strptime('${capture_ts}', '%y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
-                coalesce(title, '') AS title,
-                coalesce(selftext, '') AS body
-              FROM read_json('${in_esc}', format='newline_delimited')
-              LIMIT 1
-            ) TO '${out_esc}' (FORMAT parquet, COMPRESSION '${COMPRESSION}');
-          " >/dev/null
+          cat >> "$sql_file" <<SQL
+COPY (
+  SELECT
+    coalesce(author, '') AS author,
+    '${sid}' AS submission_id,
+    CAST(epoch(strptime('${created_str}', '%Y%m%d%H%M%S')) AS BIGINT) AS created_utc,
+    CAST(epoch(strptime('${cap14}', '%Y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
+    coalesce(title, '') AS title,
+    coalesce(selftext, '') AS body
+  FROM read_json('${in_esc}', format='newline_delimited')
+  LIMIT 1
+) TO '${out_esc}' (${copy_opts});
+SQL
         else
-          duckdb :memory: -c "
-            COPY (
-              SELECT
-                coalesce(author, '') AS author,
-                '${sid}' AS submission_id,
-                coalesce(id, '') AS comment_id,
-                coalesce(parent_id, '') AS parent_id,
-                CAST(created_utc AS BIGINT) AS created_utc,
-                CAST(epoch(strptime('${capture_ts}', '%y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
-                coalesce(body, '') AS body
-              FROM read_json('${in_esc}', format='newline_delimited')
-              WHERE id IS NOT NULL
-            ) TO '${out_esc}' (FORMAT parquet, COMPRESSION '${COMPRESSION}');
-          " >/dev/null
+          cat >> "$sql_file" <<SQL
+COPY (
+  SELECT
+    coalesce(author, '') AS author,
+    '${sid}' AS submission_id,
+    coalesce(id, '') AS comment_id,
+    coalesce(parent_id, '') AS parent_id,
+    CAST(created_utc AS BIGINT) AS created_utc,
+    CAST(epoch(strptime('${cap14}', '%Y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
+    coalesce(body, '') AS body
+  FROM read_json('${in_esc}', format='newline_delimited')
+  WHERE id IS NOT NULL
+) TO '${out_esc}' (${copy_opts});
+SQL
         fi
 
-        wrote=$((wrote+1)); g_wrote=$((g_wrote+1))
-        log_info "subreddit=$sub kind=$kind action=write thread=$y/$md/$thread file=$(basename "$f") out=$out"
+        write_metas+=("subreddit=$sub kind=$kind action=write thread=$y/$md/$thread file=$(basename "$f") out=$(basename "$out")")
+        out_paths+=("$out")
+        queued=$((queued+1))
+
+        if [[ "$queued" -ge "$BATCH_SIZE" ]]; then
+          local_flush="$queued"
+          if ! batch_flush "$sql_file" "$err_file" write_metas out_paths; then
+            rm -f "$sql_file" "$err_file"
+            task_end "reddit:01_parquet"
+            exit 2
+          fi
+          batch_init "$sql_file" "$THREADS"
+          wrote=$((wrote+local_flush)); g_wrote=$((g_wrote+local_flush))
+          queued=0
+        fi
       done < <(find "$td" -maxdepth 1 -type f -name '*.jsonl' 2>/dev/null | sort)
     done < <(list_thread_dirs "$in_root" "$LOOKBACK_DAYS")
+
+    if [[ "$queued" -gt 0 ]]; then
+      local_flush="$queued"
+      if ! batch_flush "$sql_file" "$err_file" write_metas out_paths; then
+        rm -f "$sql_file" "$err_file"
+        task_end "reddit:01_parquet"
+        exit 2
+      fi
+      batch_init "$sql_file" "$THREADS"
+      wrote=$((wrote+local_flush)); g_wrote=$((g_wrote+local_flush))
+      queued=0
+    fi
 
     log_info "subreddit=$sub kind=$kind stats threads=$threads files=$files wrote=$wrote skipped=$skipped"
   done
 
   log_info "subreddit=$sub end"
 done
+
+rm -f "$sql_file" "$err_file"
 
 log_info "done totals threads=$g_threads files=$g_files wrote=$g_wrote skipped=$g_skip"
 task_end "reddit:01_parquet"

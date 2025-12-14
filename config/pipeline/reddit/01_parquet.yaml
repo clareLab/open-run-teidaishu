@@ -3,6 +3,8 @@ parquet_root: data/reddit/01_parquet
 
 lookback_days: 0
 
+duckdb_threads: 16
+batch_size: 256
 compression: zstd
 
 subreddits:

@@ -16,7 +16,7 @@ def ts_fmt(unix_ts):
         return ""
     if v <= 0:
         return ""
-    return datetime.datetime.fromtimestamp(v, datetime.timezone.utc).strftime("%y%m%d%H%M%S")
+    return datetime.datetime.fromtimestamp(v, datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
 
 def split_created(unix_ts: int):
     dt = datetime.datetime.fromtimestamp(int(unix_ts), datetime.timezone.utc)

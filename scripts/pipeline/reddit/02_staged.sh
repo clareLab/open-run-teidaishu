@@ -30,12 +30,7 @@ list_thread_dirs() {
   done < <(iter_days "$lookback")
 }
 
-capture14() {
-  local cap12="$1"
-  duckdb :memory: -noheader -batch -c "
-    SELECT strftime(to_timestamp(epoch(strptime('${cap12}', '%y%m%d%H%M%S'))), '%Y%m%d%H%M%S');
-  " 2>/dev/null | tr -d '\r\n'
-}
+is_yyyymmddhhmmss() { [[ "$1" =~ ^[0-9]{14}$ ]]; }
 
 [[ -f "$CFG" ]] || { log_error "config not found: $CFG"; exit 1; }
 
@@ -45,7 +40,6 @@ LOOKBACK_DAYS="$(yaml_get "$CFG" "lookback_days")"
 
 PARQUET_ROOT="${PARQUET_ROOT:-data/reddit/01_parquet}"
 STAGED_ROOT="${STAGED_ROOT:-data/reddit/02_staged}"
-LOOKBACK_DAYS="${LOOKBACK_DAYS:-0}"
 LOOKBACK_DAYS="${LOOKBACK_DAYS:-0}"
 [[ "$LOOKBACK_DAYS" =~ ^[0-9]+$ ]] || { log_error "bad lookback_days=$LOOKBACK_DAYS"; exit 1; }
 
@@ -93,13 +87,17 @@ for sub in "${subs[@]}"; do
 
       fname="$(basename "$latest")"
       stem="${fname%.parquet}"
-      capture_ts="${stem%%_*}"
+      cap14="${stem%%_*}"
       hash="${stem#*_}"
-      capture_ts14="$(capture14 "$capture_ts")"
-      [[ -n "$capture_ts14" ]] || { log_error "subreddit=$sub kind=$kind action=fail reason=bad_capture_ts file=$fname"; exit 1; }
+
+      if ! is_yyyymmddhhmmss "$cap14"; then
+        log_error "subreddit=$sub kind=$kind action=fail thread=$y/$md/$thread file=$fname reason=bad_capture_ts capture=$cap14"
+        task_end "reddit:02_staged"
+        exit 2
+      fi
 
       out_dir="$ROOT_DIR/$STAGED_ROOT/r_${sub}/${kind}/${y}/${md}"
-      out="$out_dir/${thread}__${capture_ts14}_${hash}.parquet"
+      out="$out_dir/${thread}_${cap14}_${hash}.parquet"
 
       if [[ -f "$out" ]]; then
         skipped=$((skipped+1)); g_skip=$((g_skip+1))

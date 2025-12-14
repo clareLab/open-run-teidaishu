@@ -1,7 +1,7 @@
 parquet_root: data/reddit/01_parquet
 staged_root: data/reddit/02_staged
 
-lookback_days: 4
+lookback_days: 0
 
 subreddits:
   - BakaNewsJP

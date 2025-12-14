@@ -258,7 +258,7 @@ func main() {
 		}
 		stop := false
 		nextAfter := ""
-		nowStr := time.Now().UTC().Format("060102150405")
+		nowStr := time.Now().UTC().Format("20060102150405")
 		batchW := 0
 		for _, c := range lst.Data.Children {
 			created, id, name, err := createdIDName(c.Data)

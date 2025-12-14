@@ -364,7 +364,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "[%s] %s skip hash=%s\n", sub, sl.ID, h[:16])
 			continue
 		}
-		nowStr := time.Now().UTC().Format("060102150405")
+		nowStr := time.Now().UTC().Format("20060102150405")
 		out := filepath.Join(dir, nowStr+"_"+h+".jsonl")
 		fd, err := os.OpenFile(out, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
 		if err != nil {
