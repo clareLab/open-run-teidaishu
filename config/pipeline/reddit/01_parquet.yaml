@@ -1,0 +1,7 @@
+raw_root: data/reddit/00_raw
+parquet_root: data/reddit/01_parquet
+compression: zstd
+file_size_bytes: 1048576
+subreddits:
+  - BakaNewsJP
+  - lowlevelaware
