@@ -141,9 +141,7 @@ for sub in "${subs[@]}"; do
       thread="$(basename "$td")"
       y="$(basename "$(dirname "$(dirname "$td")")")"
       md="$(basename "$(dirname "$td")")"
-      hms="${thread%%_*}"
       sid="${thread#*_}"
-      created_str="${y}${md}${hms}"
 
       out_thread_dir="$ROOT_DIR/$PARQUET_ROOT/r_${sub}/${kind}/${y}/${md}/${thread}"
 
@@ -154,6 +152,7 @@ for sub in "${subs[@]}"; do
         base="$(basename "$f" .jsonl)"
         cap14="${base%%_*}"
         hash="${base#*_}"
+        hash16="${hash:0:16}"
 
         if ! is_yyyymmddhhmmss "$cap14"; then
           log_error "subreddit=$sub kind=$kind action=fail thread=$y/$md/$thread file=$(basename "$f") reason=bad_capture_ts capture=$cap14"
@@ -162,7 +161,7 @@ for sub in "${subs[@]}"; do
           exit 2
         fi
 
-        out="$out_thread_dir/${cap14}_${hash}.parquet"
+        out="$out_thread_dir/${cap14}_${hash16}.parquet"
 
         if [[ -f "$out" ]]; then
           skipped=$((skipped+1)); g_skip=$((g_skip+1))
@@ -182,11 +181,8 @@ for sub in "${subs[@]}"; do
 COPY (
   SELECT
     coalesce(author, '') AS author,
-    '${sid}' AS submission_id,
-    CAST(epoch(strptime('${created_str}', '%Y%m%d%H%M%S')) AS BIGINT) AS created_utc,
-    CAST(epoch(strptime('${cap14}', '%Y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
-    coalesce(title, '') AS title,
-    coalesce(selftext, '') AS body
+    coalesce(selftext, '') AS body,
+    coalesce(title, '') AS title
   FROM read_json('${in_esc}', format='newline_delimited')
   LIMIT 1
 ) TO '${out_esc}' (${copy_opts});
@@ -196,12 +192,9 @@ SQL
 COPY (
   SELECT
     coalesce(author, '') AS author,
-    '${sid}' AS submission_id,
+    coalesce(body, '') AS body,
     coalesce(id, '') AS comment_id,
-    coalesce(parent_id, '') AS parent_id,
-    CAST(created_utc AS BIGINT) AS created_utc,
-    CAST(epoch(strptime('${cap14}', '%Y%m%d%H%M%S')) AS BIGINT) AS capture_utc,
-    coalesce(body, '') AS body
+    coalesce(parent_id, '') AS parent_id
   FROM read_json('${in_esc}', format='newline_delimited')
   WHERE id IS NOT NULL
 ) TO '${out_esc}' (${copy_opts});

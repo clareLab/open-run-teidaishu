@@ -4,5 +4,4 @@ staged_root: data/reddit/02_staged
 lookback_days: 0
 
 subreddits:
-  - BakaNewsJP
   - lowlevelaware

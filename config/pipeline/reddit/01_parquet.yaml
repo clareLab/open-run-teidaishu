@@ -9,4 +9,5 @@ compression: zstd
 
 subreddits:
   - BakaNewsJP
+  - ja
   - lowlevelaware

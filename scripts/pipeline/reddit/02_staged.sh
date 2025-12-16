@@ -78,6 +78,8 @@ for sub in "${subs[@]}"; do
       y="$(basename "$(dirname "$(dirname "$td")")")"
       md="$(basename "$(dirname "$td")")"
       thread="$(basename "$td")"
+      hms="${thread%%_*}"
+      sid="${thread#*_}"
 
       if [[ -z "$latest" ]]; then
         empty=$((empty+1)); g_empty=$((g_empty+1))
@@ -97,7 +99,7 @@ for sub in "${subs[@]}"; do
       fi
 
       out_dir="$ROOT_DIR/$STAGED_ROOT/r_${sub}/${kind}/${y}/${md}"
-      out="$out_dir/${thread}_${cap14}_${hash}.parquet"
+      out="$out_dir/${hms}_${sid}_${cap14}_${hash}.parquet"
 
       if [[ -f "$out" ]]; then
         skipped=$((skipped+1)); g_skip=$((g_skip+1))
