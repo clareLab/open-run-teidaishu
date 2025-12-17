@@ -106,6 +106,109 @@ def _embed(client: genai.Client, model: str, texts: list[str], task_type: str, e
     res = client.models.embed_content(model=model, contents=texts, config=cfg)
     return [e.values for e in res.embeddings]
 
+def _flush(items_buf, cf_account_id, cf_token, client, args, budget_left):
+    if not items_buf or budget_left <= 0:
+        return 0, False
+
+    items_buf.sort(key=lambda x: x[0])
+
+    if len(items_buf) > budget_left:
+        items_buf = items_buf[:budget_left]
+
+    step = min(20, max(1, args.get_by_ids_batch_size))
+    log_info(f"get_by_ids plan batch_size={step} total_ids={len(items_buf)}")
+
+    remote_h = {}
+    for i in range(0, len(items_buf), step):
+        batch = items_buf[i : i + step]
+        ids = [it[0] for it in batch]
+        got = _cf_get_by_ids(cf_account_id, cf_token, args.index_name, ids)
+        for vid, md in got.items():
+            hv = ""
+            if isinstance(md, dict):
+                hv = str(md.get("h") or "")
+            if hv:
+                remote_h[vid] = hv
+        if (i // step) % 20 == 0:
+            log_info(f"get_by_ids_progress batches={(i//step)+1} remote_known={len(remote_h)}")
+
+    to_upsert = []
+    for vid, text, meta in items_buf:
+        if remote_h.get(vid) == meta.get("h"):
+            continue
+        to_upsert.append((vid, text, meta))
+
+    if not to_upsert:
+        return 0, False
+
+    to_upsert.sort(key=lambda x: x[0])
+    if len(to_upsert) > budget_left:
+        to_upsert = to_upsert[:budget_left]
+
+    log_info(f"plan to_upsert={len(to_upsert)} budget_left={budget_left}")
+
+    os.makedirs(args.index_root, exist_ok=True)
+    fd, out_path = tempfile.mkstemp(prefix="teidaishu_03_index_", suffix=".ndjson", dir=args.index_root)
+    os.close(fd)
+
+    written = 0
+    bs = max(1, args.embed_batch_size)
+    stop = False
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        for i in range(0, len(to_upsert), bs):
+            chunk = to_upsert[i : i + bs]
+            texts = [c[1] for c in chunk]
+
+            ok = False
+            last_err = None
+
+            for attempt in range(args.embed_retry_max + 1):
+                try:
+                    vals = _embed(client, args.gemini_model, texts, args.task_type, args.embed_dim)
+                    ok = True
+                    break
+                except Exception as e:
+                    last_err = e
+                    s = str(e)
+                    is_429 = ("429" in s) or ("RESOURCE_EXHAUSTED" in s)
+                    if not is_429:
+                        raise
+                    if attempt >= args.embed_retry_max:
+                        break
+                    backoff = (args.embed_retry_backoff_ms / 1000.0) * (2 ** attempt)
+                    log_warn(f"embed action=retry reason=429 attempt={attempt+1}/{args.embed_retry_max} sleep={backoff}s")
+                    time.sleep(backoff)
+
+            if not ok:
+                s = str(last_err) if last_err is not None else ""
+                log_warn(f"embed action=stop reason=429 on_embed_429={args.on_embed_429} written={written} err={s}")
+                stop = True
+                break
+
+            for (vid, _, meta), v in zip(chunk, vals):
+                f.write(json.dumps({"id": vid, "values": v, "metadata": meta}, ensure_ascii=False))
+                f.write("\n")
+                written += 1
+
+            log_info(f"embed_progress done={written}/{len(to_upsert)}")
+
+            sleep_ms = args.embed_sleep_ms + (random.randint(0, args.embed_jitter_ms) if args.embed_jitter_ms > 0 else 0)
+            if sleep_ms > 0:
+                time.sleep(sleep_ms / 1000.0)
+
+    if written <= 0:
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
+        return 0, stop
+
+    log_info(f"emit ndjson={out_path} vectors={written}")
+    sys.stdout.write(out_path + "\n")
+    sys.stdout.flush()
+    return written, stop
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--staged-root", required=True)
@@ -174,9 +277,16 @@ def main():
     candidates.sort(key=lambda x: x[2])
     log_info(f"scan candidates={len(candidates)} lookback_days={args.lookback_days}")
 
-    items = []
+    flush_size = max(1, args.get_by_ids_batch_size)
+
+    items_buf = []
     parsed = 0
+    total_written = 0
+
     for sub, kind, path in candidates:
+        if total_written >= args.max_vectors_per_run:
+            break
+
         fn = os.path.basename(path)
         m = RE_02.match(fn)
         if not m:
@@ -186,24 +296,31 @@ def main():
 
         if kind == "submissions":
             row = _read_submission_row(path)
-            if row is None:
-                continue
-            author, title, body = row
-            text = (title or "").strip()
-            b = (body or "").strip()
-            if b:
-                text = f"{text}\n\n{b}" if text else b
-            if not text:
-                continue
-            if len(text) > args.max_chars:
-                text = text[: args.max_chars]
-            h = _sha16(text)
-            vid = f"r:s:{sub}:{sid}"
-            meta = {"src": "r", "sub": sub, "t": "s", "sid": sid, "h": h}
-            items.append((vid, text, meta))
+            if row is not None:
+                author, title, body = row
+                text = (title or "").strip()
+                b = (body or "").strip()
+                if b:
+                    text = f"{text}\n\n{b}" if text else b
+                if text:
+                    if len(text) > args.max_chars:
+                        text = text[: args.max_chars]
+                    h = _sha16(text)
+                    vid = f"r:s:{sub}:{sid}"
+                    meta = {"src": "r", "sub": sub, "t": "s", "sid": sid, "h": h}
+                    items_buf.append((vid, text, meta))
+
+                    if len(items_buf) >= flush_size:
+                        w, stop = _flush(items_buf, cf_account_id, cf_token, client, args, args.max_vectors_per_run - total_written)
+                        total_written += w
+                        items_buf = []
+                        if stop:
+                            break
         else:
             rows = _read_comment_rows(path)
             for cid, pid, author, body in rows:
+                if total_written >= args.max_vectors_per_run:
+                    break
                 body = (body or "").strip()
                 if not body:
                     continue
@@ -213,106 +330,24 @@ def main():
                 h = _sha16(text)
                 vid = f"r:c:{sub}:{cid}"
                 meta = {"src": "r", "sub": sub, "t": "c", "sid": sid, "pid": pid or "", "h": h}
-                items.append((vid, text, meta))
+                items_buf.append((vid, text, meta))
+
+                if len(items_buf) >= flush_size:
+                    w, stop = _flush(items_buf, cf_account_id, cf_token, client, args, args.max_vectors_per_run - total_written)
+                    total_written += w
+                    items_buf = []
+                    if stop:
+                        break
 
         if parsed % 50 == 0:
-            log_info(f"scan_progress files_parsed={parsed} items={len(items)} last={sub}/{kind}/{fn}")
+            log_info(f"scan_progress files_parsed={parsed} items_buf={len(items_buf)} written={total_written} last={sub}/{kind}/{fn}")
 
-    if not items:
+    if items_buf and total_written < args.max_vectors_per_run:
+        w, _ = _flush(items_buf, cf_account_id, cf_token, client, args, args.max_vectors_per_run - total_written)
+        total_written += w
+
+    if total_written <= 0:
         return
-
-    items.sort(key=lambda x: x[0])
-    log_info(f"build items={len(items)}")
-
-    remote_h = {}
-    step = min(20, max(1, args.get_by_ids_batch_size))
-    log_info(f"get_by_ids plan batch_size={step} total_ids={len(items)}")
-    for i in range(0, len(items), step):
-        batch = items[i : i + step]
-        ids = [it[0] for it in batch]
-        got = _cf_get_by_ids(cf_account_id, cf_token, args.index_name, ids)
-        for vid, md in got.items():
-            hv = ""
-            if isinstance(md, dict):
-                hv = str(md.get("h") or "")
-            if hv:
-                remote_h[vid] = hv
-        if (i // step) % 20 == 0:
-            log_info(f"get_by_ids_progress batches={(i//step)+1} remote_known={len(remote_h)}")
-
-    to_upsert = []
-    for vid, text, meta in items:
-        if remote_h.get(vid) == meta.get("h"):
-            continue
-        to_upsert.append((vid, text, meta))
-
-    if not to_upsert:
-        log_info("action=skip reason=all_up_to_date")
-        return
-
-    to_upsert.sort(key=lambda x: x[0])
-    if len(to_upsert) > args.max_vectors_per_run:
-        to_upsert = to_upsert[: args.max_vectors_per_run]
-
-    log_info(f"plan to_upsert={len(to_upsert)} max_vectors_per_run={args.max_vectors_per_run}")
-
-    os.makedirs(args.index_root, exist_ok=True)
-    fd, out_path = tempfile.mkstemp(prefix="teidaishu_03_index_", suffix=".ndjson", dir=args.index_root)
-    os.close(fd)
-
-    written = 0
-    bs = max(1, args.embed_batch_size)
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for i in range(0, len(to_upsert), bs):
-            chunk = to_upsert[i : i + bs]
-            texts = [c[1] for c in chunk]
-
-            ok = False
-            last_err = None
-
-            for attempt in range(args.embed_retry_max + 1):
-                try:
-                    vals = _embed(client, args.gemini_model, texts, args.task_type, args.embed_dim)
-                    ok = True
-                    break
-                except Exception as e:
-                    last_err = e
-                    s = str(e)
-                    is_429 = ("429" in s) or ("RESOURCE_EXHAUSTED" in s)
-                    if not is_429:
-                        raise
-                    if attempt >= args.embed_retry_max:
-                        break
-                    backoff = (args.embed_retry_backoff_ms / 1000.0) * (2 ** attempt)
-                    log_warn(f"embed action=retry reason=429 attempt={attempt+1}/{args.embed_retry_max} sleep={backoff}s")
-                    time.sleep(backoff)
-
-            if not ok:
-                s = str(last_err) if last_err is not None else ""
-                log_warn(f"embed action=stop reason=429 on_embed_429={args.on_embed_429} written={written} err={s}")
-                break
-
-            for (vid, _, meta), v in zip(chunk, vals):
-                f.write(json.dumps({"id": vid, "values": v, "metadata": meta}, ensure_ascii=False))
-                f.write("\n")
-                written += 1
-
-            log_info(f"embed_progress done={written}/{len(to_upsert)}")
-
-            sleep_ms = args.embed_sleep_ms + (random.randint(0, args.embed_jitter_ms) if args.embed_jitter_ms > 0 else 0)
-            if sleep_ms > 0:
-                time.sleep(sleep_ms / 1000.0)
-
-    if written <= 0:
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
-        return
-
-    log_info(f"emit ndjson={out_path} vectors={written}")
-    sys.stdout.write(out_path)
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,5 @@
 staged_root: data/reddit/02_staged
-lookback_days: 4
+lookback_days: 0
 
 vectorize_index: open-run-teidaishu-reddit-ja
 vector_dim: 1536
@@ -11,8 +11,8 @@ task_type: RETRIEVAL_DOCUMENT
 embed_batch_size: 20
 get_by_ids_batch_size: 256
 
-max_chars: 16384
-max_vectors_per_run: 4096
+max_chars: 65536
+max_vectors_per_run: 1048576
 
 embed_sleep_ms: 1024
 embed_jitter_ms: 512

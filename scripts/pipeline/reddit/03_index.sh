@@ -76,7 +76,18 @@ log_info "cfg=$CFG staged_root=$STAGED_ROOT index_root=$INDEX_ROOT lookback_days
 
 mkdir -p "$ROOT_DIR/$INDEX_ROOT"
 
-ndjson_path="$(
+did_any=0
+
+while IFS= read -r ndjson_path; do
+  [[ -n "${ndjson_path:-}" ]] || continue
+  did_any=1
+  log_info "action=upsert file=$(basename "$ndjson_path")"
+  curl -fsS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${INDEX_NAME}/upsert" \
+    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+    -H "Content-Type: application/x-ndjson" \
+    --data-binary "@${ndjson_path}" >/dev/null
+  rm -f "$ndjson_path"
+done < <(
   "$PY" "$ROOT_DIR/apps/reddit/index/cmd/indexer/main.py" \
     --staged-root "$ROOT_DIR/$STAGED_ROOT" \
     --index-root "$ROOT_DIR/$INDEX_ROOT" \
@@ -96,20 +107,11 @@ ndjson_path="$(
     --embed-retry-backoff-ms "$EMBED_RETRY_BACKOFF_MS" \
     --on-embed-429 "$ON_EMBED_429" \
     $(printf -- "--sub %s " "${subs[@]}")
-)"
+)
 
-if [[ -z "${ndjson_path:-}" ]]; then
+if [[ "$did_any" -eq 0 ]]; then
   log_info "action=skip reason=no_vectors"
-  task_end "reddit:03_index"
-  exit 0
 fi
 
-log_info "action=upsert file=$(basename "$ndjson_path")"
-curl -fsS "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${INDEX_NAME}/upsert" \
-  -H "Authorization: Bearer ${CF_API_TOKEN}" \
-  -H "Content-Type: application/x-ndjson" \
-  --data-binary "@${ndjson_path}" >/dev/null
-
-rm -f "$ndjson_path"
 log_info "action=done"
 task_end "reddit:03_index"

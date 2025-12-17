@@ -1,7 +1,7 @@
 raw_root: data/reddit/00_raw
 parquet_root: data/reddit/01_parquet
 
-lookback_days: 0
+lookback_days: 16
 
 duckdb_threads: 16
 batch_size: 256
