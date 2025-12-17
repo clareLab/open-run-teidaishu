@@ -53,6 +53,15 @@ ask-rag QUERY:
       --max-output-tokens 4096 \
       "{{QUERY}}"
 
+worker-deploy:
+    pnpm exec wrangler deploy --cwd apps/teidaishu/worker
+
+worker-query q:
+    URL={{env_var_or_default("WORKER_URL","")}} bash scripts/tools/worker_query.sh "{{q}}"
+
+worker-ask q:
+    URL={{env_var_or_default("WORKER_URL","")}} bash scripts/tools/worker_ask.sh "{{q}}"
+
 pl-reddit:
     just pl-reddit-00 && \
     just pl-reddit-01 && \
